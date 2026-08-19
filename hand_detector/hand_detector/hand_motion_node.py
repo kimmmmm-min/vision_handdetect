@@ -118,7 +118,7 @@ class HandMotionNode(Node):
 
         self.declare_parameter('landmarks_topic', '/hand_detector/hand_landmarks')
         self.declare_parameter('motion_topic', '/hand_detector/hand_motion')
-        self.declare_parameter('process_noise_sigma', 4.0)  # m/s^3 (jerk std)
+        self.declare_parameter('process_noise_sigma', 3.0)  # m/s^3 (jerk std)
         self.declare_parameter('depth_relative_error', 0.02)  # 2% at any range
         self.declare_parameter('min_measurement_sigma', 0.005)  # meters
         self.declare_parameter('max_range', 5.0)  # meters, sanity bound
