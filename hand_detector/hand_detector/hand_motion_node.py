@@ -5,13 +5,13 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 
-from geometry_msgs.msg import PoseArray
-
-from hand_detector_msgs.msg import HandMotion
+from hand_detector_msgs.msg import HandLandmarksArray, HandMotion
 
 NUM_LANDMARKS = 21
 # indices averaged to get the palm-center representative point
 PALM_LANDMARK_INDICES = (0, 5, 17)
+
+HAND_LABELS = {HandMotion.LEFT: 'left', HandMotion.RIGHT: 'right'}
 
 # chi-square critical value, 3 degrees of freedom, 99% confidence.
 # Used to gate measurements that are statistically implausible given the
@@ -111,6 +111,20 @@ class ConstantAccelerationKalmanFilter:
         self.P = (I - K @ self.H) @ self.P
 
 
+class HandTracker:
+    """Independent Kalman-filter tracking state for one hand (left/right).
+
+    Kept separate per handedness so one hand going unseen/timing out never
+    touches the other hand's filter state.
+    """
+
+    def __init__(self, kf: ConstantAccelerationKalmanFilter):
+        self.kf = kf
+        self.initialized = False
+        self.last_proc_time_s = None
+        self.last_meas_time_s = None
+
+
 class HandMotionNode(Node):
 
     def __init__(self):
@@ -136,31 +150,35 @@ class HandMotionNode(Node):
         self._reset_timeout = self.get_parameter('reset_timeout_sec').value
         self._gate_threshold = self.get_parameter('gate_chi2_threshold').value
 
-        self._kf = ConstantAccelerationKalmanFilter(
-            process_noise_sigma=self.get_parameter('process_noise_sigma').value,
-            initial_pos_var=self.get_parameter('initial_pos_var').value,
-            initial_vel_var=self.get_parameter('initial_vel_var').value,
-            initial_accel_var=self.get_parameter('initial_accel_var').value,
-        )
+        def make_kf():
+            return ConstantAccelerationKalmanFilter(
+                process_noise_sigma=self.get_parameter('process_noise_sigma').value,
+                initial_pos_var=self.get_parameter('initial_pos_var').value,
+                initial_vel_var=self.get_parameter('initial_vel_var').value,
+                initial_accel_var=self.get_parameter('initial_accel_var').value,
+            )
 
-        self._initialized = False
-        self._last_proc_time_s = None
-        self._last_meas_time_s = None
+        # One independent tracker per handedness - a hand that goes unseen
+        # or times out only resets its own tracker, never the other hand's.
+        self._trackers = {
+            HandMotion.LEFT: HandTracker(make_kf()),
+            HandMotion.RIGHT: HandTracker(make_kf()),
+        }
 
         self._sub = self.create_subscription(
-            PoseArray, landmarks_topic, self._landmarks_cb, 10)
+            HandLandmarksArray, landmarks_topic, self._landmarks_cb, 10)
         self._pub = self.create_publisher(HandMotion, motion_topic, 10)
 
         self.get_logger().info(
             f'hand_motion_node ready. landmarks={landmarks_topic} motion={motion_topic}')
 
-    def _extract_palm_center(self, msg: PoseArray):
-        if len(msg.poses) < NUM_LANDMARKS:
+    def _extract_palm_center(self, landmarks):
+        if len(landmarks) < NUM_LANDMARKS:
             return None
 
         pts = []
         for idx in PALM_LANDMARK_INDICES:
-            p = msg.poses[idx].position
+            p = landmarks[idx]
             if math.isnan(p.x) or math.isnan(p.y) or math.isnan(p.z):
                 return None
             pts.append((p.x, p.y, p.z))
@@ -178,53 +196,70 @@ class HandMotionNode(Node):
         sigma = max(self._depth_rel_error * measured_distance, self._min_meas_sigma)
         return np.diag([sigma ** 2, sigma ** 2, sigma ** 2])
 
-    def _landmarks_cb(self, msg: PoseArray):
+    def _landmarks_cb(self, msg: HandLandmarksArray):
         now_s = stamp_to_seconds(msg.header.stamp)
-        measurement = self._extract_palm_center(msg)
 
-        if not self._initialized:
+        measurements = {HandMotion.LEFT: None, HandMotion.RIGHT: None}
+        for hand in msg.hands:
+            if hand.handedness in measurements:
+                measurements[hand.handedness] = self._extract_palm_center(
+                    hand.landmarks)
+
+        # Each tracker publishes its own standalone HandMotion, so a
+        # subscriber sees exactly the same message shape as before - just
+        # with `handedness` saying which hand it belongs to. A tracker with
+        # nothing to report stays silent rather than emitting a placeholder.
+        for handedness, tracker in self._trackers.items():
+            self._update_tracker(
+                tracker, handedness, measurements[handedness], now_s, msg.header)
+
+    def _update_tracker(self, tracker: HandTracker, handedness: int,
+                        measurement, now_s: float, header):
+        if not tracker.initialized:
             if measurement is None:
                 return
-            self._kf.reinit(measurement)
-            self._initialized = True
-            self._last_proc_time_s = now_s
-            self._last_meas_time_s = now_s
-            self._publish(msg.header, tracking=True)
+            tracker.kf.reinit(measurement)
+            tracker.initialized = True
+            tracker.last_proc_time_s = now_s
+            tracker.last_meas_time_s = now_s
+            self._publish(tracker.kf, header, handedness, tracking=True)
             return
 
-        dt = now_s - self._last_proc_time_s
+        dt = now_s - tracker.last_proc_time_s
         if dt <= 0.0:
             self.get_logger().warn(
                 'Non-increasing timestamp on hand_landmarks, dropping message',
                 throttle_duration_sec=5.0)
             return
-        self._last_proc_time_s = now_s
+        tracker.last_proc_time_s = now_s
 
-        self._kf.predict(dt)
+        tracker.kf.predict(dt)
 
         accepted = False
         if measurement is not None:
             distance = float(np.linalg.norm(measurement))
             R = self._measurement_noise(distance)
-            y, S = self._kf.innovation(measurement, R)
-            if self._kf.mahalanobis_sq(y, S) <= self._gate_threshold:
-                self._kf.update(measurement, R)
+            y, S = tracker.kf.innovation(measurement, R)
+            if tracker.kf.mahalanobis_sq(y, S) <= self._gate_threshold:
+                tracker.kf.update(measurement, R)
                 accepted = True
-                self._last_meas_time_s = now_s
+                tracker.last_meas_time_s = now_s
 
         if not accepted:
-            since_last_meas = now_s - self._last_meas_time_s
+            since_last_meas = now_s - tracker.last_meas_time_s
             if since_last_meas > self._reset_timeout:
                 self.get_logger().warn(
-                    f'No accepted hand measurement for {since_last_meas:.2f}s, '
-                    'resetting motion filter', throttle_duration_sec=1.0)
-                self._initialized = False
+                    f'No accepted {HAND_LABELS[handedness]} hand measurement for '
+                    f'{since_last_meas:.2f}s, resetting motion filter',
+                    throttle_duration_sec=1.0)
+                tracker.initialized = False
                 return
 
-        self._publish(msg.header, tracking=accepted)
+        self._publish(tracker.kf, header, handedness, tracking=accepted)
 
-    def _publish(self, header, tracking: bool):
-        x = self._kf.x
+    def _publish(self, kf: ConstantAccelerationKalmanFilter, header,
+                 handedness: int, tracking: bool):
+        x = kf.x
         position = x[0:3]
         velocity = x[3:6]
         acceleration = x[6:9]
@@ -242,6 +277,7 @@ class HandMotionNode(Node):
 
         out = HandMotion()
         out.header = header
+        out.handedness = handedness
         out.tracking = tracking
         out.position.x, out.position.y, out.position.z = position.tolist()
         out.velocity.x, out.velocity.y, out.velocity.z = velocity.tolist()

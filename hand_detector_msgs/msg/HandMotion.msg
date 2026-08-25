@@ -2,6 +2,10 @@
 
 std_msgs/Header header
 
+uint8 LEFT=0
+uint8 RIGHT=1
+uint8 handedness
+
 # true when this cycle had a measurement accepted by the filter;
 # false when coasting on prediction alone (hand not detected / rejected outlier)
 bool tracking

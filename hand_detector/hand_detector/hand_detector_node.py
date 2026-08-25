@@ -1,4 +1,5 @@
 import array
+import math
 import os
 import sys
 
@@ -14,8 +15,8 @@ from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseArray, Pose
 
+from hand_detector_msgs.msg import HandLandmarks, HandLandmarksArray
 from hand_detector.onnx_hand import PalmDetection, HandLandmark
 from hand_detector.onnx_hand.utils import rotate_and_crop_rectangle
 
@@ -33,6 +34,41 @@ HAND_CONNECTIONS = [
 
 DEFAULT_TRT_CACHE_DIR = os.path.join(
     os.path.expanduser('~'), '.cache', 'hand_detector_trt')
+
+
+def _handedness_from_3d(landmarks):
+    """Determine left/right from real 3D landmark geometry rather than 2D
+    image appearance.
+
+    Uses the scalar triple product of (wrist->index_mcp) x (wrist->pinky_mcp)
+    . (wrist->thumb_cmc). For any *rigid rotation* of a hand (e.g. turning
+    it to show the back instead of the palm) this sign is invariant - only
+    an actual mirror image (a genuinely different, opposite hand) flips it.
+    That makes it robust to the palm/back-of-hand viewing angle in a way a
+    2D-appearance classifier structurally cannot be.
+
+    Returns HandLandmarks.LEFT/RIGHT, or None if the required points don't
+    have valid (non-NaN) depth this frame.
+    """
+    wrist, thumb_cmc, index_mcp, pinky_mcp = (
+        landmarks[0], landmarks[1], landmarks[5], landmarks[17])
+    for p in (wrist, thumb_cmc, index_mcp, pinky_mcp):
+        if math.isnan(p.x) or math.isnan(p.y) or math.isnan(p.z):
+            return None
+
+    w = np.array([wrist.x, wrist.y, wrist.z])
+    t = np.array([thumb_cmc.x, thumb_cmc.y, thumb_cmc.z]) - w
+    i = np.array([index_mcp.x, index_mcp.y, index_mcp.z]) - w
+    p = np.array([pinky_mcp.x, pinky_mcp.y, pinky_mcp.z]) - w
+    triple = float(np.dot(np.cross(i, p), t))
+    # Sign convention calibrated against real hardware (the armchair-
+    # derived assumption was backwards - real-hand test showed both
+    # hands swapped, a pure global flip, which is expected: getting any
+    # one of the anatomical sign assumptions backwards flips the overall
+    # sign uniformly for every orientation, so this flip doesn't undermine
+    # the front/back rotation-invariance itself, only the label mapping).
+    # negative -> left hand, positive -> right hand.
+    return HandLandmarks.LEFT if triple < 0.0 else HandLandmarks.RIGHT
 
 
 class HandDetectorNode(Node):
@@ -77,6 +113,7 @@ class HandDetectorNode(Node):
                 models_dir, 'palm_detection_full_inf_post_192x192.onnx'),
             score_threshold=self.get_parameter(
                 'min_detection_confidence').value,
+            max_hands=num_hands,
             engine_cache_dir=engine_cache_dir,
         )
         self._hand_landmark = HandLandmark(
@@ -110,7 +147,7 @@ class HandDetectorNode(Node):
         self._overlay_pub = self.create_publisher(
             Image, '/hand_detector/image_overlay', 10)
         self._landmarks_pub = self.create_publisher(
-            PoseArray, '/hand_detector/hand_landmarks', 10)
+            HandLandmarksArray, '/hand_detector/hand_landmarks', 10)
 
         self.get_logger().info(
             f'hand_detector_node ready. color={color_topic} depth={depth_topic} '
@@ -153,8 +190,8 @@ class HandDetectorNode(Node):
         # untouched frame, so a defensive copy would just be wasted work.
         overlay = rgb
 
-        pose_array = PoseArray()
-        pose_array.header = color_msg.header
+        landmarks_array = HandLandmarksArray()
+        landmarks_array.header = color_msg.header
 
         hands = self._palm_detection(rgb)
         # hand: sqn_rr_size, rotation, sqn_rr_center_x, sqn_rr_center_y
@@ -177,29 +214,56 @@ class HandDetectorNode(Node):
                 operation_when_cropping_out_of_range='padding')
 
             if len(cropped_hand_images) > 0:
-                hand_landmarks, _ = self._hand_landmark(
+                hand_landmarks, rotated_image_size_leftrights = self._hand_landmark(
                     images=cropped_hand_images, rects=rects)
 
-                for landmarks_21x2 in hand_landmarks:
+                for landmarks_21x2, size_leftright in zip(
+                        hand_landmarks, rotated_image_size_leftrights):
                     pixel_coords = [(int(u), int(v)) for u, v in landmarks_21x2]
 
-                    for (u, v) in pixel_coords:
-                        pose = Pose()
+                    hand_msg = HandLandmarks()
+
+                    # `landmarks` is a fixed-size Point[21] that rosidl has
+                    # already pre-populated, so fill the existing entries in
+                    # place. Appending instead would leave those 21 zeroed
+                    # placeholders as the published payload and push the real
+                    # coordinates out to indices 21..41, where they are
+                    # dropped on serialization.
+                    for point, (u, v) in zip(hand_msg.landmarks, pixel_coords):
                         if 0 <= u < width and 0 <= v < height:
                             z = float(depth[v, u]) * depth_scale
                         else:
                             z = 0.0
 
                         if z > 0.0:
-                            pose.position.x = (u - cx) * z / fx
-                            pose.position.y = (v - cy) * z / fy
-                            pose.position.z = z
+                            point.x = (u - cx) * z / fx
+                            point.y = (v - cy) * z / fy
+                            point.z = z
                         else:
-                            pose.position.x = float('nan')
-                            pose.position.y = float('nan')
-                            pose.position.z = float('nan')
-                        pose.orientation.w = 1.0
-                        pose_array.poses.append(pose)
+                            point.x = float('nan')
+                            point.y = float('nan')
+                            point.z = float('nan')
+
+                    # The ONNX model's own left/right classification looks
+                    # only at the 2D crop's appearance, which is ambiguous
+                    # for the back of a hand - it looks like the mirror
+                    # image (i.e. the OTHER hand's palm), so back-facing
+                    # hands get misclassified. With real depth we have true
+                    # 3D landmark positions, so compute chirality
+                    # geometrically instead - that's invariant to viewing
+                    # angle (front/back), only flipping for an actual
+                    # mirror-image (left vs right) hand. Falls back to the
+                    # model's classification if depth was invalid at the
+                    # landmarks it needs.
+                    handedness_3d = _handedness_from_3d(hand_msg.landmarks)
+                    if handedness_3d is not None:
+                        hand_msg.handedness = handedness_3d
+                    else:
+                        hand_msg.handedness = (
+                            HandLandmarks.RIGHT if size_leftright[2] >= 0.5
+                            else HandLandmarks.LEFT)
+
+                    landmarks_array.hands.append(hand_msg)
 
                     for connection in HAND_CONNECTIONS:
                         p1 = pixel_coords[connection[0]]
@@ -208,7 +272,8 @@ class HandDetectorNode(Node):
                     for (u, v) in pixel_coords:
                         cv2.circle(overlay, (u, v), 4, (255, 0, 0), -1)
 
-        self._landmarks_pub.publish(pose_array)
+        if len(landmarks_array.hands) > 0:
+            self._landmarks_pub.publish(landmarks_array)
 
         overlay_msg = Image()
         overlay_msg.header = color_msg.header

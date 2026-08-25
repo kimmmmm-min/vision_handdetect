@@ -34,10 +34,21 @@ class PalmDetection:
         self,
         model_path: str,
         score_threshold: float = 0.60,
+        max_hands: int = 2,
+        nms_iou_threshold: float = 0.3,
         engine_cache_dir: Optional[str] = None,
         providers: Optional[List] = None,
     ):
         self.score_threshold = score_threshold
+        self.nms_iou_threshold = nms_iou_threshold
+        # HandLandmark's TensorRT engine is built with a fixed optimization
+        # profile capped at max_hands (see hand_landmark.py's
+        # trt_profile_max_shapes) - feeding it a bigger batch than that
+        # isn't a graceful failure, it's a hard TensorRT EP_FAIL that
+        # crashes the whole node. Capping here (keeping the
+        # highest-confidence detections) is what actually enforces that
+        # limit; nothing downstream does.
+        self.max_hands = max_hands
 
         providers = providers if providers is not None else copy.deepcopy(DEFAULT_PROVIDERS)
         if engine_cache_dir is not None:
@@ -101,11 +112,66 @@ class PalmDetection:
         padded_image = padded_image.transpose(swap)
         return np.ascontiguousarray(padded_image, dtype=np.float32)
 
+    @staticmethod
+    def _nms(boxes: np.ndarray, iou_threshold: float) -> np.ndarray:
+        """Greedy NMS over the raw axis-aligned (box_x, box_y, box_size)
+        squares, highest score first.
+
+        This model's raw output has no built-in deduplication: a single
+        physical hand routinely trips several nearby anchors at once, each
+        clearing score_threshold independently. Without merging those down
+        to one detection first, capping "keep the top max_hands by score"
+        can keep two overlapping boxes for the SAME hand while dropping a
+        genuinely different, lower-scoring second hand.
+        """
+        if len(boxes) <= 1:
+            return boxes
+
+        scores = boxes[:, 0]
+        half = boxes[:, 3] / 2.0
+        x1, y1 = boxes[:, 1] - half, boxes[:, 2] - half
+        x2, y2 = boxes[:, 1] + half, boxes[:, 2] + half
+        areas = (x2 - x1) * (y2 - y1)
+        order = np.argsort(scores)[::-1]
+
+        keep = []
+        while len(order) > 0:
+            i = order[0]
+            keep.append(i)
+            if len(order) == 1:
+                break
+            rest = order[1:]
+            xx1 = np.maximum(x1[i], x1[rest])
+            yy1 = np.maximum(y1[i], y1[rest])
+            xx2 = np.minimum(x2[i], x2[rest])
+            yy2 = np.minimum(y2[i], y2[rest])
+            inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+            union = areas[i] + areas[rest] - inter
+            iou = np.where(union > 0, inter / union, 0.0)
+            order = rest[iou <= iou_threshold]
+
+        return boxes[keep, :]
+
     def __postprocess(self, image: np.ndarray, boxes: np.ndarray) -> np.ndarray:
         image_height, image_width = image.shape[:2]
         hands = []
         keep = boxes[:, 0] > self.score_threshold
         boxes = boxes[keep, :]
+
+        boxes = self._nms(boxes, self.nms_iou_threshold)
+
+        # HandLandmark's TensorRT engine is built with a fixed optimization
+        # profile capped at max_hands (see hand_landmark.py's
+        # trt_profile_max_shapes) - feeding it a bigger batch than that
+        # isn't a graceful failure, it's a hard TensorRT EP_FAIL that
+        # crashes the whole node. This is the actual enforcement of that
+        # limit; nothing downstream does it. NMS above already removed
+        # same-hand duplicates, so what's left here (if still over
+        # max_hands) is presumably distinct detections - keep the
+        # highest-confidence ones.
+        if len(boxes) > self.max_hands:
+            top = np.argsort(boxes[:, 0])[::-1][:self.max_hands]
+            boxes = boxes[top, :]
 
         for box in boxes:
             pd_score, box_x, box_y, box_size, kp0_x, kp0_y, kp2_x, kp2_y = box

@@ -28,6 +28,7 @@ setup(
         'console_scripts': [
             'hand_detector_node = hand_detector.hand_detector_node:main',
             'hand_motion_node = hand_detector.hand_motion_node:main',
+            'hand_motion_overlay_node = hand_detector.hand_motion_overlay_node:main',
         ],
     },
 )
